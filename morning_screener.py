@@ -1,14 +1,16 @@
-"""Утренний отчёт в Telegram: сигналы + развороты + события с smart-lab."""
+"""Утренний отчёт: перепроданность + развороты + отскоки + события."""
 import os
 import sys
 from datetime import datetime, timezone, timedelta
 
 import requests
-from scan_moex import scan, scan_reverse, RSI_THRESHOLD, LOOKBACK_DAYS
+from scan_moex import (scan, scan_reverse, scan_rebound,
+                       RSI_THRESHOLD, LOOKBACK_DAYS)
 from smartlab_events import get_events
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+MSK = timezone(timedelta(hours=3))
 
 
 def send_telegram(token, chat_id, message):
@@ -42,13 +44,12 @@ def send_long(token, chat_id, message):
         send_telegram(token, chat_id, p)
 
 
-def _events_block(tickers_list, max_per_ticker=4):
-    """Формирует текстовый блок событий для списка тикеров."""
-    if not tickers_list:
+def events_block(tickers, limit=15):
+    if not tickers:
         return ""
-    events = get_events(tickers_list, max_per_ticker=max_per_ticker)
+    events = get_events(tickers[:limit])
     lines = []
-    for t in tickers_list:
+    for t in tickers[:limit]:
         evs = events.get(t, [])
         if not evs:
             continue
@@ -57,20 +58,16 @@ def _events_block(tickers_list, max_per_ticker=4):
             lines.append(f"  • {ev['date']} — {ev['text']}")
     if not lines:
         return ""
-    return "\n📅 *Предстоящие события:*\n" + "\n".join(lines) + "\n"
+    return "\n\n📅 *Предстоящие события:*\n" + "\n".join(lines)
 
 
 def format_oversold(result):
-    msk = timezone(timedelta(hours=3))
-    now = datetime.now(msk).strftime('%d.%m.%Y %H:%M')
+    now = datetime.now(MSK).strftime('%d.%m.%Y %H:%M')
     signals = result['signals']
     checked = result['checked']
-
     if not signals:
-        return (f"📊 *RSI Screener MOEX* — перепроданность\n"
-                f"_{now} МСК_\n\n"
-                f"🔍 Сигналов RSI < {RSI_THRESHOLD} на 4H за "
-                f"{LOOKBACK_DAYS} дней не найдено.\n\n"
+        return (f"📊 *RSI Screener* — перепроданность\n_{now} МСК_\n\n"
+                f"🔍 Сигналов RSI < {RSI_THRESHOLD} не найдено.\n"
                 f"Проверено: {checked}")
 
     seen = {}
@@ -79,11 +76,10 @@ def format_oversold(result):
             seen[s['ticker']] = s
     uniq = list(seen.values())
 
-    header = (f"📊 *RSI Screener MOEX* — перепроданность\n"
-              f"_{now} МСК_\n\n"
-              f"🟢 RSI < {RSI_THRESHOLD} на 4H\n"
-              f"Сигналов: *{len(signals)}* | Уникальных: *{len(uniq)}*\n"
-              f"Проверено: {checked}\n\n")
+    msg = (f"📊 *RSI Screener* — перепроданность\n_{now} МСК_\n\n"
+           f"🟢 RSI < {RSI_THRESHOLD}\n"
+           f"Сигналов: *{len(signals)}* | Уникальных: *{len(uniq)}*\n"
+           f"Проверено: {checked}\n\n")
 
     lines, chunk = [], []
     for s in uniq:
@@ -93,28 +89,18 @@ def format_oversold(result):
             chunk = []
     if chunk:
         lines.append(" · ".join(chunk))
-
-    body = header + "\n".join(lines)
-
-    # Добавляем события (макс. 15 тикеров, чтобы не тормозить)
-    tickers_list = [s['ticker'] for s in uniq[:15]]
-    body += _events_block(tickers_list)
-
-    return body
+    msg += "\n".join(lines)
+    msg += events_block([s['ticker'] for s in uniq[:15]])
+    return msg
 
 
 def format_reverse(result):
-    msk = timezone(timedelta(hours=3))
-    now = datetime.now(msk).strftime('%d.%m.%Y %H:%M')
+    now = datetime.now(MSK).strftime('%d.%m.%Y %H:%M')
     crossovers = result['crossovers']
     checked = result['checked']
-
     if not crossovers:
-        return (f"📊 *RSI Screener MOEX* — развороты\n"
-                f"_{now} МСК_\n\n"
-                f"🔍 Разворотов (RSI вышел из < {RSI_THRESHOLD} за "
-                f"{LOOKBACK_DAYS} дней) не найдено.\n\n"
-                f"Проверено: {checked}")
+        return (f"📊 *RSI Screener* — развороты\n_{now} МСК_\n\n"
+                f"🔍 Разворотов не найдено.\nПроверено: {checked}")
 
     seen = {}
     for c in crossovers:
@@ -122,44 +108,69 @@ def format_reverse(result):
             seen[c['ticker']] = c
     uniq = list(seen.values())
 
-    header = (f"📊 *RSI Screener MOEX* — развороты\n"
-              f"_{now} МСК_\n\n"
-              f"🔴 RSI пересёк {RSI_THRESHOLD} снизу вверх\n"
-              f"Сигналов: *{len(crossovers)}* | Уникальных: *{len(uniq)}*\n"
-              f"Проверено: {checked}\n\n")
+    msg = (f"📊 *RSI Screener* — развороты\n_{now} МСК_\n\n"
+           f"🔴 RSI пересёк {RSI_THRESHOLD} снизу вверх\n"
+           f"Сигналов: *{len(crossovers)}* | Уникальных: *{len(uniq)}*\n"
+           f"Проверено: {checked}\n\n")
 
-    lines = []
     for c in uniq:
-        lines.append(
-            f"`{c['ticker']}` {c['rsi_before']:.1f}→{c['rsi_after']:.1f} "
-            f"· {c['price']:.2f}"
-        )
+        msg += (f"`{c['ticker']}` {c['rsi_before']:.1f}→"
+                f"{c['rsi_after']:.1f} · {c['price']:.2f}\n")
 
-    body = header + "\n".join(lines)
+    msg += events_block([c['ticker'] for c in uniq[:10]])
+    return msg
 
-    # События только для топ-10 разворотов
-    tickers_list = [c['ticker'] for c in uniq[:10]]
-    body += _events_block(tickers_list)
 
-    return body
+def format_rebound(result):
+    now = datetime.now(MSK).strftime('%d.%m.%Y %H:%M')
+    rebounds = result['rebounds']
+    checked = result['checked']
+    if not rebounds:
+        return (f"📊 *RSI Screener* — отскоки\n_{now} МСК_\n\n"
+                f"🔍 Отскоков не найдено.\nПроверено: {checked}")
+
+    seen = {}
+    for r in rebounds:
+        if r['ticker'] not in seen:
+            seen[r['ticker']] = r
+    uniq = list(seen.values())
+
+    msg = (f"📊 *RSI Screener* — отскоки\n_{now} МСК_\n\n"
+           f"🚀 RSI был < 30, поднялся > 33\n"
+           f"Сигналов: *{len(rebounds)}* | Уникальных: *{len(uniq)}*\n"
+           f"Проверено: {checked}\n\n")
+
+    for r in uniq:
+        msg += (f"`{r['ticker']}` {r['low_rsi']:.1f} → {r['rebound_rsi']:.1f}\n"
+                f"  цена: {r['low_price']:.2f} → {r['rebound_price']:.2f}\n\n")
+
+    msg += events_block([r['ticker'] for r in uniq[:10]])
+    return msg
 
 
 def main():
-    print(f"Старт: {datetime.now()}")
+    print(f"Старт: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M МСК')}")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("Нет TELEGRAM_TOKEN или TELEGRAM_CHAT_ID")
         sys.exit(1)
 
     try:
-        print("Прямой скан...")
+        print("1/3 Перепроданность...")
         result = scan()
         print(f"  Сигналов: {len(result['signals'])}")
         send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, format_oversold(result))
 
-        print("Обратный скан...")
+        print("2/3 Развороты...")
         rev = scan_reverse()
         print(f"  Разворотов: {len(rev['crossovers'])}")
-        send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, format_reverse(rev))
+        if rev['crossovers']:
+            send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, format_reverse(rev))
+
+        print("3/3 Отскоки...")
+        reb = scan_rebound()
+        print(f"  Отскоков: {len(reb['rebounds'])}")
+        if reb['rebounds']:
+            send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, format_rebound(reb))
 
         print("Готово")
     except Exception as e:
