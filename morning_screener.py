@@ -1,20 +1,24 @@
-"""Утренний скрининг RSI: запуск + отправка в Telegram.
+"""Утренний скрининг MOEX: RSI < 27 на 4H за неделю. Отправка в Telegram.
 
-Запускается через GitHub Actions по расписанию.
-Токены берёт из переменных окружения.
+Автономный — сам качает данные с MOEX ISS, сам считает RSI,
+сам находит сигналы. Не зависит от других скриптов.
 """
+import json
 import os
-import re
-import subprocess
-import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
 
 import requests
 
-SCRIPT_PATH = Path(__file__).parent / "screen_history_week.py"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+RSI_THRESHOLD = 27
+LOOKBACK_DAYS = 7
+HISTORY_DAYS = 30
+PAUSE_SEC = 0.1
 
 
 def send_telegram(token, chat_id, message):
@@ -25,82 +29,144 @@ def send_telegram(token, chat_id, message):
         r.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Ошибка отправки в Telegram: {e}")
+        print(f"Telegram error: {e}")
         return False
 
 
-def run_screener():
-    if not SCRIPT_PATH.exists():
-        print(f"Файл {SCRIPT_PATH} не найден")
-        return None
+def get_tickers():
+    url = ("https://iss.moex.com/iss/engines/stock/markets/shares/"
+           "boards/TQBR/securities.json")
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+    sec = data['securities']
+    cols = sec['columns']
+    secid_i = cols.index('SECID')
+    sectype_i = cols.index('SECTYPE')
+    return [row[secid_i] for row in sec['data']
+            if str(row[sectype_i]) in ('1', '2')]
+
+
+def fetch_candles(secid, days):
+    from_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+    url = (f"https://iss.moex.com/iss/engines/stock/markets/shares/"
+           f"securities/{secid}/candles.json"
+           f"?interval=60&from={from_date}")
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        r = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH)],
-            capture_output=True, text=True, encoding='utf-8',
-            errors='replace', timeout=1200,
-            cwd=str(SCRIPT_PATH.parent),
-        )
-        return r.stdout
-    except subprocess.TimeoutExpired:
-        print("Скрипт работал больше 20 минут и был остановлен")
-        return None
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        return None
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            d = json.loads(resp.read().decode('utf-8'))
+            return d['candles']['data'], d['candles']['columns']
+    except Exception:
+        return None, None
 
 
-def parse_signals(stdout):
-    if not stdout:
+def aggregate_4h(candles, columns):
+    if not candles or len(candles) < 4:
         return []
-    signals = []
-    for line in stdout.split('\n'):
-        line = line.strip()
-        if '|' not in line:
-            continue
-        parts = [p.strip() for p in line.split('|')]
-        if len(parts) < 4:
-            continue
-        ticker = parts[0]
-        if not re.match(r'^[A-Z][A-Z0-9]{2,8}$', ticker):
-            continue
-        try:
-            rsi = float(parts[2].replace(',', '.'))
-            price = float(parts[3].replace(',', '.'))
-        except (ValueError, IndexError):
-            continue
-        signals.append({
-            'ticker': ticker,
-            'datetime': parts[1],
-            'rsi': rsi,
-            'price': price,
+    idx = {c: i for i, c in enumerate(columns)}
+    result = []
+    for i in range(0, len(candles) - 3, 4):
+        chunk = candles[i:i+4]
+        result.append({
+            'open': chunk[0][idx['open']],
+            'close': chunk[-1][idx['close']],
+            'high': max(c[idx['high']] for c in chunk),
+            'low': min(c[idx['low']] for c in chunk),
+            'begin': chunk[0][idx['begin']],
         })
-    return signals
+    return result
 
 
-def format_message(signals):
+def calc_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return [None] * len(closes)
+    rsi = [None] * len(closes)
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    rsi[period] = 100 if al == 0 else 100 - (100 / (1 + ag/al))
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        rsi[i+1] = 100 if al == 0 else 100 - (100 / (1 + ag/al))
+    return rsi
+
+
+def scan():
+    print("Получение списка тикеров...")
+    tickers = get_tickers()
+    print(f"Всего тикеров: {len(tickers)}")
+
+    cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS)
+    signals = []
+    checked = 0
+
+    for i, secid in enumerate(tickers, 1):
+        candles, cols = fetch_candles(secid, HISTORY_DAYS)
+        if not candles or len(candles) < 100:
+            continue
+        c4 = aggregate_4h(candles, cols)
+        if len(c4) < 20:
+            continue
+        closes = [c['close'] for c in c4]
+        rsi = calc_rsi(closes, 14)
+        checked += 1
+
+        for j, c in enumerate(c4):
+            if rsi[j] is None:
+                continue
+            try:
+                dt = datetime.strptime(c['begin'], '%Y-%m-%d %H:%M:%S')
+            except Exception:
+                continue
+            if dt >= cutoff and rsi[j] < RSI_THRESHOLD:
+                signals.append({
+                    'ticker': secid,
+                    'datetime': c['begin'],
+                    'rsi': rsi[j],
+                    'price': c['close'],
+                    'current_rsi': rsi[-1] if rsi[-1] else 0,
+                })
+        time.sleep(PAUSE_SEC)
+        if i % 50 == 0:
+            print(f"  {i}/{len(tickers)}...")
+
+    signals.sort(key=lambda x: x['datetime'], reverse=True)
+    print(f"Проверено: {checked}, найдено сигналов: {len(signals)}")
+    return signals, checked
+
+
+def format_message(signals, checked):
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk).strftime('%d.%m.%Y %H:%M')
 
     if not signals:
         return (f"📊 *RSI Screener MOEX* — утренний отчёт\n"
                 f"_{now} МСК_\n\n"
-                f"🔍 Сигналов RSI < 27 на 4H за неделю не найдено.")
+                f"🔍 Сигналов RSI < {RSI_THRESHOLD} на 4H за "
+                f"{LOOKBACK_DAYS} дней не найдено.\n\n"
+                f"Проверено акций: {checked}")
 
     seen = {}
     for s in signals:
         if s['ticker'] not in seen:
             seen[s['ticker']] = s
 
-    unique_list = list(seen.values())
-
+    uniq = list(seen.values())
     header = (f"📊 *RSI Screener MOEX* — утренний отчёт\n"
               f"_{now} МСК_\n\n"
               f"Сигналов: *{len(signals)}* | "
-              f"Уникальных тикеров: *{len(unique_list)}*\n\n")
+              f"Уникальных тикеров: *{len(uniq)}*\n"
+              f"Проверено акций: {checked}\n\n")
 
     lines = []
     chunk = []
-    for s in unique_list:
+    for s in uniq:
         chunk.append(f"`{s['ticker']}` {s['rsi']:.1f}")
         if len(chunk) == 4:
             lines.append(" · ".join(chunk))
@@ -111,45 +177,49 @@ def format_message(signals):
     return header + "\n".join(lines)
 
 
-def send_long_message(token, chat_id, message):
-    """Разбивает длинное сообщение на части по 4000 символов."""
+def send_long(token, chat_id, message):
     if len(message) <= 4000:
         send_telegram(token, chat_id, message)
         return
-
     lines = message.split('\n')
-    parts = []
-    current = ""
+    parts, cur = [], ""
     for line in lines:
-        if len(current) + len(line) + 1 > 4000:
-            parts.append(current)
-            current = line + "\n"
+        if len(cur) + len(line) + 1 > 4000:
+            parts.append(cur)
+            cur = line + "\n"
         else:
-            current += line + "\n"
-    if current.strip():
-        parts.append(current)
-
-    for i, part in enumerate(parts):
+            cur += line + "\n"
+    if cur.strip():
+        parts.append(cur)
+    for i, p in enumerate(parts):
         if len(parts) > 1:
-            part += f"\n\n_Часть {i+1}/{len(parts)}_"
-        send_telegram(token, chat_id, part)
+            p += f"\n\n_Часть {i+1}/{len(parts)}_"
+        send_telegram(token, chat_id, p)
 
 
 def main():
-    print(f"Запуск утреннего скрининга: {datetime.now()}")
+    print(f"Старт: {datetime.now()}")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ОШИБКА: TELEGRAM_TOKEN или TELEGRAM_CHAT_ID не заданы")
-        sys.exit(1)
+        print("Нет TELEGRAM_TOKEN или TELEGRAM_CHAT_ID")
+        return
 
-    print("Запуск screen_history_week.py...")
-    stdout = run_screener()
-    signals = parse_signals(stdout)
-    print(f"Найдено сигналов: {len(signals)}")
-
-    message = format_message(signals)
-    send_long_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, message)
-    print("Готово")
+    try:
+        signals, checked = scan()
+        msg = format_message(signals, checked)
+        send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+        print("Готово")
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()[:3500]
+        print(err)
+        try:
+            send_telegram(
+                TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+                f"❌ *Ошибка скринера*\n\n```\n{err}\n```"
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
