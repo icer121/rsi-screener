@@ -1,4 +1,4 @@
-"""Единый движок MOEX. Обычный скан + обратное пересечение."""
+"""Единый движок скрининга MOEX. МСК + keep-alive + отскоки."""
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -86,7 +86,7 @@ def calc_rsi(closes, period=14):
     return rsi
 
 
-# ============ ОБЫЧНЫЙ СКАН (RSI < 30) ============
+# ============ ПРЯМОЙ СКАН (RSI < 30) ============
 def process_ticker(secid, cutoff):
     candles, cols = fetch_candles(secid, HISTORY_DAYS)
     if not candles or len(candles) < 100:
@@ -163,7 +163,7 @@ def scan(progress_callback=None):
     return {'signals': signals, 'charts': charts, 'checked': checked}
 
 
-# ============ ОБРАТНЫЙ СКАН (RSI пересёк 30 снизу вверх) ============
+# ============ РАЗВОРОТЫ (RSI пересёк 30 снизу вверх) ============
 def process_ticker_reverse(secid, cutoff):
     candles, cols = fetch_candles(secid, HISTORY_DAYS)
     if not candles or len(candles) < 100:
@@ -182,7 +182,6 @@ def process_ticker_reverse(secid, cutoff):
             dt = datetime.strptime(c4[j]['begin'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=MSK)
         except Exception:
             continue
-        # Пересечение снизу вверх: было < 30, стало >= 30
         if rsi[j-1] < RSI_THRESHOLD and rsi[j] >= RSI_THRESHOLD:
             if dt >= cutoff:
                 crossovers.append({
@@ -211,8 +210,7 @@ def process_ticker_reverse(secid, cutoff):
 def scan_reverse(progress_callback=None):
     tickers = get_tickers()
     cutoff = datetime.now(MSK) - timedelta(days=LOOKBACK_DAYS)
-    crossovers = []
-    checked, processed = 0, 0
+    crossovers, checked, processed = [], 0, 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_ticker_reverse, secid, cutoff): secid
@@ -233,20 +231,98 @@ def scan_reverse(progress_callback=None):
     return {'crossovers': crossovers, 'checked': checked}
 
 
+# ============ ОТСКОКИ (RSI был < 30, стал > 33) ============
+def process_ticker_rebound(secid, cutoff):
+    candles, cols = fetch_candles(secid, HISTORY_DAYS)
+    if not candles or len(candles) < 100:
+        return None
+    c4 = aggregate_4h(candles, cols)
+    if len(c4) < 20:
+        return None
+    closes = [c['close'] for c in c4]
+    rsi = calc_rsi(closes, 14)
+
+    rebounds = []
+    was_below = False
+    low_info = None
+
+    for j, c in enumerate(c4):
+        if rsi[j] is None:
+            continue
+        try:
+            dt = datetime.strptime(c['begin'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=MSK)
+        except Exception:
+            continue
+        if dt < cutoff:
+            continue
+
+        if rsi[j] < 30:
+            was_below = True
+            low_info = {
+                'date': c['begin'],
+                'rsi': rsi[j],
+                'price': c['close'],
+            }
+        elif was_below and rsi[j] > 33:
+            rebounds.append({
+                'ticker': secid,
+                'low_date': low_info['date'],
+                'low_rsi': low_info['rsi'],
+                'low_price': low_info['price'],
+                'rebound_date': c['begin'],
+                'rebound_rsi': rsi[j],
+                'rebound_price': c['close'],
+                'current_rsi': rsi[-1] if rsi[-1] else 0,
+                'current_price': closes[-1],
+            })
+            was_below = False
+
+    if not rebounds:
+        return {'checked': 1, 'rebounds': []}
+    return {'checked': 1, 'rebounds': rebounds}
+
+
+def scan_rebound(progress_callback=None):
+    tickers = get_tickers()
+    cutoff = datetime.now(MSK) - timedelta(days=LOOKBACK_DAYS)
+    rebounds, checked, processed = [], 0, 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_ticker_rebound, secid, cutoff): secid
+                   for secid in tickers}
+        for future in as_completed(futures):
+            processed += 1
+            if progress_callback:
+                progress_callback(processed, len(tickers), futures[future])
+            try:
+                r = future.result()
+                if r:
+                    checked += r['checked']
+                    rebounds.extend(r['rebounds'])
+            except Exception:
+                pass
+
+    rebounds.sort(key=lambda x: x['rebound_date'], reverse=True)
+    return {'rebounds': rebounds, 'checked': checked}
+
+
 if __name__ == "__main__":
     start = time.time()
     print(f"Время: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M МСК')}")
     print(f"Потоков: {MAX_WORKERS}")
 
-    print("\n=== Прямой скан (RSI < 30) ===")
+    print("\n=== Прямой скан ===")
     result = scan()
-    print(f"Проверено: {result['checked']}")
     print(f"Сигналов: {len(result['signals'])}")
     print(f"Уникальных: {len(set(s['ticker'] for s in result['signals']))}")
 
-    print("\n=== Обратный скан (пересечение 30 снизу вверх) ===")
+    print("\n=== Развороты ===")
     rev = scan_reverse()
     print(f"Разворотов: {len(rev['crossovers'])}")
-    print(f"Уникальных: {len(set(c['ticker'] for c in rev['crossovers']))}")
+
+    print("\n=== Отскоки ===")
+    reb = scan_rebound()
+    print(f"Отскоков: {len(reb['rebounds'])}")
+    print(f"Уникальных: {len(set(r['ticker'] for r in reb['rebounds']))}")
 
     print(f"\nОбщее время: {time.time()-start:.1f} сек")
