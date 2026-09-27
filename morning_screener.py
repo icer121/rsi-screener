@@ -1,10 +1,11 @@
-"""Утренний отчёт в Telegram: сигналы + развороты."""
+"""Утренний отчёт в Telegram: сигналы + развороты + события с smart-lab."""
 import os
 import sys
 from datetime import datetime, timezone, timedelta
 
 import requests
 from scan_moex import scan, scan_reverse, RSI_THRESHOLD, LOOKBACK_DAYS
+from smartlab_events import get_events
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -41,6 +42,24 @@ def send_long(token, chat_id, message):
         send_telegram(token, chat_id, p)
 
 
+def _events_block(tickers_list, max_per_ticker=4):
+    """Формирует текстовый блок событий для списка тикеров."""
+    if not tickers_list:
+        return ""
+    events = get_events(tickers_list, max_per_ticker=max_per_ticker)
+    lines = []
+    for t in tickers_list:
+        evs = events.get(t, [])
+        if not evs:
+            continue
+        lines.append(f"\n*{t}*")
+        for ev in evs:
+            lines.append(f"  • {ev['date']} — {ev['text']}")
+    if not lines:
+        return ""
+    return "\n📅 *Предстоящие события:*\n" + "\n".join(lines) + "\n"
+
+
 def format_oversold(result):
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk).strftime('%d.%m.%Y %H:%M')
@@ -58,8 +77,8 @@ def format_oversold(result):
     for s in signals:
         if s['ticker'] not in seen:
             seen[s['ticker']] = s
-
     uniq = list(seen.values())
+
     header = (f"📊 *RSI Screener MOEX* — перепроданность\n"
               f"_{now} МСК_\n\n"
               f"🟢 RSI < {RSI_THRESHOLD} на 4H\n"
@@ -75,7 +94,13 @@ def format_oversold(result):
     if chunk:
         lines.append(" · ".join(chunk))
 
-    return header + "\n".join(lines)
+    body = header + "\n".join(lines)
+
+    # Добавляем события (макс. 15 тикеров, чтобы не тормозить)
+    tickers_list = [s['ticker'] for s in uniq[:15]]
+    body += _events_block(tickers_list)
+
+    return body
 
 
 def format_reverse(result):
@@ -95,8 +120,8 @@ def format_reverse(result):
     for c in crossovers:
         if c['ticker'] not in seen:
             seen[c['ticker']] = c
-
     uniq = list(seen.values())
+
     header = (f"📊 *RSI Screener MOEX* — развороты\n"
               f"_{now} МСК_\n\n"
               f"🔴 RSI пересёк {RSI_THRESHOLD} снизу вверх\n"
@@ -110,7 +135,13 @@ def format_reverse(result):
             f"· {c['price']:.2f}"
         )
 
-    return header + "\n".join(lines)
+    body = header + "\n".join(lines)
+
+    # События только для топ-10 разворотов
+    tickers_list = [c['ticker'] for c in uniq[:10]]
+    body += _events_block(tickers_list)
+
+    return body
 
 
 def main():
