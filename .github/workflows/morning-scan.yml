@@ -4,7 +4,7 @@ on:
   schedule:
     # 10:00 МСК = 07:00 UTC
     - cron: '0 7 * * *'
-  workflow_dispatch:  # позволяет запустить вручную
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -29,4 +29,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MAX_WORKERS: "15"
         run: python morning_screener.py
