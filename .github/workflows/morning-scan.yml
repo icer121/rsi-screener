@@ -2,8 +2,7 @@ name: Morning RSI Scan
 
 on:
   schedule:
-    # 10:00 МСК = 07:00 UTC
-    - cron: '0 7 * * *'
+    - cron: '0 7 * * *'   # 10:00 МСК
   workflow_dispatch:
 
 jobs:
