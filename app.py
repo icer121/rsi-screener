@@ -1,14 +1,12 @@
-"""RSI Screener MOEX + Telegram + пароль."""
+"""Streamlit-интерфейс. Использует единый движок scan_moex.py."""
 import os
-import re
-import subprocess
-import sys
-from pathlib import Path
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
+
+from scan_moex import scan, RSI_THRESHOLD, LOOKBACK_DAYS
 
 st.set_page_config(page_title="RSI Screener MOEX", page_icon="📈",
                    layout="wide", initial_sidebar_state="expanded")
@@ -22,37 +20,30 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ============ ПРОВЕРКА ПАРОЛЯ ============
+# ============ ПАРОЛЬ ============
 try:
     required_password = st.secrets["app"]["password"]
-except (KeyError, FileNotFoundError, Exception):
-    required_password = ""  # локально без пароля (если нет в secrets.toml)
+except Exception:
+    required_password = ""
 
 if required_password:
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
-
     if not st.session_state.authenticated:
         st.title("🔒 RSI Screener MOEX")
-        st.caption("Введите пароль для доступа к скринеру")
-
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            pwd = st.text_input("Пароль", type="password", key="pwd_input")
+        c1, c2, c3 = st.columns([1, 2, 1])
+        with c2:
+            pwd = st.text_input("Пароль", type="password")
             if st.button("Войти", type="primary", use_container_width=True):
                 if pwd == required_password:
                     st.session_state.authenticated = True
                     st.rerun()
                 else:
                     st.error("❌ Неверный пароль")
-        st.stop()  # останавливаем остальную страницу
+        st.stop()
 
 
-SCRIPT_PATH = Path(__file__).parent / "screen_history_week.py"
-
-
-# ============ TELEGRAM ============
-def send_telegram_message(token, chat_id, message):
+def send_telegram(token, chat_id, message):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
@@ -63,223 +54,104 @@ def send_telegram_message(token, chat_id, message):
         return False, f"❌ Ошибка: {e}"
 
 
-def send_all_tickers(token, chat_id, signals):
-    seen = {}
-    for s in signals:
-        if s['Тикер'] not in seen:
-            seen[s['Тикер']] = s
-
-    unique_list = list(seen.values())
-    total_signals = len(signals)
-    total_unique = len(unique_list)
-
-    header = (f"📊 *RSI Screener MOEX*\n\n"
-              f"Сигналов: *{total_signals}* | "
-              f"Уникальных тикеров: *{total_unique}*\n\n")
-
-    lines = []
-    chunk = []
-    for s in unique_list:
-        chunk.append(f"`{s['Тикер']}` {s['RSI тогда']:.1f}")
-        if len(chunk) == 4:
-            lines.append(" · ".join(chunk))
-            chunk = []
-    if chunk:
-        lines.append(" · ".join(chunk))
-
-    max_len = 4000
-    messages = []
-    current = header
-    for line in lines:
-        if len(current) + len(line) + 1 > max_len:
-            messages.append(current)
-            current = line + "\n"
-        else:
-            current += line + "\n"
-    if current.strip():
-        messages.append(current)
-
-    success_count = 0
-    for i, msg_part in enumerate(messages):
-        if len(messages) > 1:
-            msg_part += f"\n\n_Часть {i+1}/{len(messages)}_"
-        ok, _ = send_telegram_message(token, chat_id, msg_part)
-        if ok:
-            success_count += 1
-
-    return success_count, len(messages)
-
-
-# ============ СКРИПТ ============
-def run_screener():
-    if not SCRIPT_PATH.exists():
-        return None, f"Файл {SCRIPT_PATH} не найден"
-    try:
-        r = subprocess.run(
-            [sys.executable, str(SCRIPT_PATH)],
-            capture_output=True, text=True, encoding='utf-8',
-            errors='replace', timeout=900, cwd=str(SCRIPT_PATH.parent),
-        )
-        return r.stdout, r.stderr
-    except subprocess.TimeoutExpired:
-        return None, "Таймаут (>15 минут)"
-    except Exception as e:
-        return None, str(e)
-
-
-def parse_signals(stdout):
-    if not stdout:
-        return []
-    signals = []
-    for line in stdout.split('\n'):
-        line = line.strip()
-        if '|' not in line:
-            continue
-        parts = [p.strip() for p in line.split('|')]
-        if len(parts) < 4:
-            continue
-        ticker = parts[0]
-        if not re.match(r'^[A-Z][A-Z0-9]{2,8}$', ticker):
-            continue
-        try:
-            rsi = float(parts[2].replace(',', '.'))
-            price = float(parts[3].replace(',', '.'))
-        except (ValueError, IndexError):
-            continue
-        sig = {
-            'Тикер': ticker,
-            'Дата/время': parts[1],
-            'RSI тогда': rsi,
-            'Цена тогда': price,
-        }
-        if len(parts) >= 5:
-            try:
-                sig['Текущий RSI'] = float(parts[4].replace(',', '.'))
-            except ValueError:
-                pass
-        signals.append(sig)
-    return signals
-
-
-# ============ САЙДБАР ============
 st.sidebar.title("⚙️ Управление")
 
 with st.sidebar.expander("📨 Настройки Telegram", expanded=False):
     default_token = os.environ.get("TELEGRAM_TOKEN", "")
     default_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
-
     if not default_token:
         try:
             default_token = st.secrets["telegram"]["token"]
             default_chat = st.secrets["telegram"]["chat_id"]
-        except (KeyError, FileNotFoundError, Exception):
+        except Exception:
             pass
-
-    telegram_token = st.text_input(
-        "Токен бота", type="password", value=default_token,
-        key='tg_token_input'
-    )
-    telegram_chat_id = st.text_input(
-        "Chat ID", value=default_chat,
-        key='tg_chat_input'
-    )
-
-    if default_token and default_chat:
-        st.caption("✅ Токен загружен автоматически")
-    else:
-        st.caption("⚠️ Введите токен и chat_id вручную")
-
-    if st.button("📤 Тест уведомления"):
-        if telegram_token and telegram_chat_id:
-            ok, info = send_telegram_message(
-                telegram_token, telegram_chat_id,
-                "🔔 *Тест RSI Screener*\n\n"
-                "Если вы видите это сообщение — настройка работает!"
-            )
-            if ok:
-                st.success(info)
-            else:
-                st.error(info)
-        else:
-            st.warning("Заполните токен и chat_id")
+    telegram_token = st.text_input("Токен бота", type="password",
+                                    value=default_token)
+    telegram_chat_id = st.text_input("Chat ID", value=default_chat)
 
 st.sidebar.markdown("---")
+st.sidebar.caption(f"Порог RSI: {RSI_THRESHOLD} · Период: {LOOKBACK_DAYS} дней")
 
 if st.sidebar.button("🚀 Запустить скрининг", type="primary",
                       use_container_width=True):
-    with st.spinner("Скрипт работает… Подождите 2–4 минуты"):
-        stdout, stderr = run_screener()
-        st.session_state.stdout = stdout
-        st.session_state.stderr = stderr
-        st.session_state.signals = parse_signals(stdout) if stdout else []
+    progress = st.progress(0.0, text="Загрузка...")
 
-    signals = st.session_state.signals
-    if signals and telegram_token and telegram_chat_id:
-        with st.spinner("Отправка в Telegram..."):
-            sent, total = send_all_tickers(
-                telegram_token, telegram_chat_id, signals
-            )
-        if sent == total:
-            st.sidebar.success(f"✅ Отправлено сообщений: {sent}")
-        else:
-            st.sidebar.error(f"Отправлено {sent}/{total}")
+    def cb(i, total, secid):
+        progress.progress(i / total, text=f"{i}/{total} — {secid}")
 
-if st.sidebar.button("🗑 Очистить результаты", use_container_width=True):
-    for k in ['stdout', 'stderr', 'signals']:
-        st.session_state.pop(k, None)
+    result = scan(progress_callback=cb)
+    progress.empty()
+    st.session_state.data = result
+
+    if result['signals'] and telegram_token and telegram_chat_id:
+        seen = {}
+        for s in result['signals']:
+            if s['ticker'] not in seen:
+                seen[s['ticker']] = s
+        lines, chunk = [], []
+        for s in seen.values():
+            chunk.append(f"`{s['ticker']}` {s['rsi']:.1f}")
+            if len(chunk) == 4:
+                lines.append(" · ".join(chunk))
+                chunk = []
+        if chunk:
+            lines.append(" · ".join(chunk))
+        msg = (f"📊 *RSI Screener MOEX (веб)*\n\n"
+               f"Сигналов: *{len(result['signals'])}* | "
+               f"Уникальных: *{len(seen)}*\n\n" + "\n".join(lines))
+        ok, info = send_telegram(telegram_token, telegram_chat_id, msg)
+        (st.sidebar.success if ok else st.sidebar.error)(info)
+
+if st.sidebar.button("🗑 Очистить", use_container_width=True):
+    st.session_state.pop('data', None)
     st.rerun()
 
 if st.sidebar.button("🚪 Выйти", use_container_width=True):
     st.session_state.authenticated = False
     st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"Скрипт: {SCRIPT_PATH.name}")
 
-
-# ============ ОСНОВНАЯ ОБЛАСТЬ ============
 st.title("📈 RSI Screener MOEX")
-st.caption("Сигналы RSI < 27 на 4H за неделю + график TradingView")
+st.caption(f"Сигналы RSI < {RSI_THRESHOLD} на 4H за {LOOKBACK_DAYS} дней")
 
-if 'signals' not in st.session_state:
-    st.info("👈 Заполните настройки Telegram и нажмите **«Запустить скрининг»**")
+if 'data' not in st.session_state:
+    st.info("👈 Нажмите **«Запустить скрининг»**")
 else:
-    signals = st.session_state.signals
+    data = st.session_state.data
+    signals = data['signals']
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Проверено", data['checked'])
+    c2.metric("Сигналов", len(signals))
+    c3.metric("Уникальных", len(set(s['ticker'] for s in signals)))
+
     if not signals:
         st.warning("Сигналы не найдены.")
-        st.code(st.session_state.get('stdout', '')[:5000])
     else:
-        c1, c2 = st.columns(2)
-        c1.metric("Найдено сигналов", len(signals))
-        c2.metric("Уникальных тикеров",
-                  len(set(s['Тикер'] for s in signals)))
-
-        df = pd.DataFrame(signals)
-        st.dataframe(df, use_container_width=True, hide_index=True,
-                     height=350)
+        rows = []
+        for s in signals:
+            chg = ((s['current_price'] - s['price']) / s['price']) * 100
+            rows.append({
+                'Тикер': s['ticker'],
+                'Дата/время': s['datetime'],
+                'RSI тогда': round(s['rsi'], 2),
+                'Цена тогда': round(s['price'], 2),
+                'Цена сейчас': round(s['current_price'], 2),
+                'Изм. %': round(chg, 2),
+                'Текущий RSI': round(s['current_rsi'], 2),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                     hide_index=True, height=350)
 
         st.markdown("---")
-        st.subheader("📊 График TradingView")
-
-        uniq = sorted(set(s['Тикер'] for s in signals))
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            selected = st.selectbox("Акция", uniq)
-        with col2:
-            period = st.radio("Период", ["7д", "14д", "30д"],
-                              horizontal=True, index=1)
-
-        bars = {"7д": 42, "14д": 84, "30д": 180}[period]
-
+        uniq = sorted(set(s['ticker'] for s in signals))
+        selected = st.selectbox("График", uniq)
         if selected:
-            widget_html = f"""
+            widget = f"""
             <iframe
-                src="https://s.tradingview.com/widgetembed/?symbol=MOEX%3A{selected}&interval=240&theme=dark&style=1&locale=ru&hide_side_toolbar=0&allow_symbol_change=1&withdateranges=1&studies=RSI%40tv-basicstudies&range={bars}"
+                src="https://s.tradingview.com/widgetembed/?symbol=MOEX%3A{selected}&interval=240&theme=dark&style=1&locale=ru&hide_side_toolbar=0&allow_symbol_change=1&withdateranges=1&studies=RSI%40tv-basicstudies&range=84"
                 width="100%" height="750" frameborder="0"
                 allowtransparency="true" scrolling="no">
             </iframe>
             """
-            components.html(widget_html, height=780, scrolling=False)
-
-        with st.expander("📜 Полный вывод скрипта"):
-            st.code(st.session_state.get('stdout', '')[:15000])
+            components.html(widget, height=780, scrolling=False)
