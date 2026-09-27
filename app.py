@@ -1,4 +1,4 @@
-"""RSI Screener MOEX + Telegram (работает локально и на Hugging Face)."""
+"""RSI Screener MOEX + Telegram + пароль."""
 import os
 import re
 import subprocess
@@ -21,7 +21,33 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Относительный путь — работает и на Windows, и на Linux
+
+# ============ ПРОВЕРКА ПАРОЛЯ ============
+try:
+    required_password = st.secrets["app"]["password"]
+except (KeyError, FileNotFoundError, Exception):
+    required_password = ""  # локально без пароля (если нет в secrets.toml)
+
+if required_password:
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒 RSI Screener MOEX")
+        st.caption("Введите пароль для доступа к скринеру")
+
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            pwd = st.text_input("Пароль", type="password", key="pwd_input")
+            if st.button("Войти", type="primary", use_container_width=True):
+                if pwd == required_password:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("❌ Неверный пароль")
+        st.stop()  # останавливаем остальную страницу
+
+
 SCRIPT_PATH = Path(__file__).parent / "screen_history_week.py"
 
 
@@ -38,7 +64,6 @@ def send_telegram_message(token, chat_id, message):
 
 
 def send_all_tickers(token, chat_id, signals):
-    """Отправляет все уникальные тикеры, разбивая на сообщения."""
     seen = {}
     for s in signals:
         if s['Тикер'] not in seen:
@@ -103,7 +128,6 @@ def run_screener():
 
 
 def parse_signals(stdout):
-    """Парсит строки: TICKER | дата время | RSI | цена | тек.RSI"""
     if not stdout:
         return []
     signals = []
@@ -141,11 +165,9 @@ def parse_signals(stdout):
 st.sidebar.title("⚙️ Управление")
 
 with st.sidebar.expander("📨 Настройки Telegram", expanded=False):
-    # 1) Пробуем переменные окружения (Hugging Face / облако)
     default_token = os.environ.get("TELEGRAM_TOKEN", "")
     default_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-    # 2) Если пусто — пробуем secrets.toml (локальный запуск)
     if not default_token:
         try:
             default_token = st.secrets["telegram"]["token"]
@@ -205,6 +227,10 @@ if st.sidebar.button("🚀 Запустить скрининг", type="primary",
 if st.sidebar.button("🗑 Очистить результаты", use_container_width=True):
     for k in ['stdout', 'stderr', 'signals']:
         st.session_state.pop(k, None)
+    st.rerun()
+
+if st.sidebar.button("🚪 Выйти", use_container_width=True):
+    st.session_state.authenticated = False
     st.rerun()
 
 st.sidebar.markdown("---")
