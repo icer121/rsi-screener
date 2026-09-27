@@ -1,5 +1,6 @@
-"""Единый движок MOEX. Параллельная загрузка + МСК + диагностика."""
+"""Единый движок скрининга MOEX. МСК-время + параллельная загрузка."""
 import json
+import os
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 RSI_THRESHOLD = 30
 LOOKBACK_DAYS = 7
 HISTORY_DAYS = 30
-MAX_WORKERS = 4  # снижено с 10 — MOEX банит за >5
+
+# Локально — 4 потока, в облаке задаётся через переменную MAX_WORKERS
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 
 MSK = timezone(timedelta(hours=3))
 
@@ -36,9 +39,9 @@ def fetch_candles(secid, days):
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             d = json.loads(resp.read().decode('utf-8'))
-            return secid, d['candles']['data'], d['candles']['columns']
-    except Exception as e:
-        return secid, None, str(e)  # возвращаем текст ошибки
+            return d['candles']['data'], d['candles']['columns']
+    except Exception:
+        return None, None
 
 
 def aggregate_4h(candles, columns):
@@ -77,34 +80,16 @@ def calc_rsi(closes, period=14):
     return rsi
 
 
-# Диагностические счётчики
-stats = {'ok': 0, 'no_data': 0, 'short': 0, 'error': 0, 'errors': []}
-
-
 def process_ticker(secid, cutoff):
-    result = fetch_candles(secid, HISTORY_DAYS)
-    if len(result) == 3:
-        secid, candles, cols = result
-    else:
-        secid, candles, cols = result[0], result[1], None
-
-    if candles is None:
-        stats['error'] += 1
-        if len(stats['errors']) < 5:
-            stats['errors'].append((secid, cols))
+    candles, cols = fetch_candles(secid, HISTORY_DAYS)
+    if not candles or len(candles) < 100:
         return None
-    if len(candles) < 100:
-        stats['short'] += 1
-        return None
-
     c4 = aggregate_4h(candles, cols)
     if len(c4) < 20:
-        stats['no_data'] += 1
         return None
 
     closes = [c['close'] for c in c4]
     rsi = calc_rsi(closes, 14)
-    stats['ok'] += 1
 
     ticker_signals = []
     for j, c in enumerate(c4):
@@ -146,8 +131,6 @@ def process_ticker(secid, cutoff):
 
 
 def scan(progress_callback=None):
-    for k in stats:
-        stats[k] = 0 if isinstance(stats[k], int) else []
     tickers = get_tickers()
     cutoff = datetime.now(MSK) - timedelta(days=LOOKBACK_DAYS)
     signals = []
@@ -169,16 +152,11 @@ def scan(progress_callback=None):
                     signals.extend(r['signals'])
                     if r['chart'] and r['signals']:
                         charts[r['signals'][0]['ticker']] = r['chart']
-            except Exception as e:
-                stats['errors'].append((futures[future], str(e)))
+            except Exception:
+                pass
 
     signals.sort(key=lambda x: x['datetime'], reverse=True)
-    return {
-        'signals': signals,
-        'charts': charts,
-        'checked': checked,
-        'stats': dict(stats),
-    }
+    return {'signals': signals, 'charts': charts, 'checked': checked}
 
 
 if __name__ == "__main__":
@@ -192,18 +170,10 @@ if __name__ == "__main__":
             print(f"  {i}/{total} — {secid}")
 
     result = scan(progress_callback=show_progress)
-    elapsed = time.time() - start
-
-    print(f"\nВремя: {elapsed:.1f} сек")
+    print(f"\nВремя: {time.time()-start:.1f} сек")
     print(f"Проверено: {result['checked']}")
     print(f"Сигналов: {len(result['signals'])}")
-    print(f"Уникальных тикеров: {len(set(s['ticker'] for s in result['signals']))}")
-    print("\n=== ДИАГНОСТИКА ===")
-    print(f"  OK:           {result['stats']['ok']}")
-    print(f"  Мало свечей:  {result['stats']['short']}")
-    print(f"  Мало 4H:      {result['stats']['no_data']}")
-    print(f"  Ошибок:       {result['stats']['error']}")
-    if result['stats']['errors']:
-        print("  Примеры ошибок:")
-        for secid, err in result['stats']['errors'][:3]:
-            print(f"    {secid}: {err}")
+    print(f"Уникальных: {len(set(s['ticker'] for s in result['signals']))}")
+    print()
+    for s in result['signals'][:30]:
+        print(f"  {s['ticker']:8} {s['datetime']} RSI={s['rsi']:.1f} Цена={s['price']:.2f}")
