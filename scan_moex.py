@@ -1,27 +1,36 @@
-"""Единый движок скрининга MOEX. МСК-время + параллельная загрузка."""
-import json
+"""Единый движок скрининга MOEX. МСК + keep-alive соединения."""
 import os
 import time
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 RSI_THRESHOLD = 30
 LOOKBACK_DAYS = 7
 HISTORY_DAYS = 30
-
-# Локально — 4 потока, в облаке задаётся через переменную MAX_WORKERS
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 
 MSK = timezone(timedelta(hours=3))
+
+# Глобальная сессия — переиспользует TCP-соединение между запросами
+_session = requests.Session()
+_session.headers.update({'User-Agent': 'Mozilla/5.0'})
+# Пул соединений: по одному на каждый поток + запас
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS + 2,
+    pool_maxsize=MAX_WORKERS + 2,
+    max_retries=2,
+)
+_session.mount('https://', _adapter)
+_session.mount('http://', _adapter)
 
 
 def get_tickers():
     url = ("https://iss.moex.com/iss/engines/stock/markets/shares/"
            "boards/TQBR/securities.json")
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
+    resp = _session.get(url, timeout=20)
+    data = resp.json()
     sec = data['securities']
     cols = sec['columns']
     secid_i = cols.index('SECID')
@@ -35,11 +44,10 @@ def fetch_candles(secid, days):
     url = (f"https://iss.moex.com/iss/engines/stock/markets/shares/"
            f"securities/{secid}/candles.json"
            f"?interval=60&from={from_date}")
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            d = json.loads(resp.read().decode('utf-8'))
-            return d['candles']['data'], d['candles']['columns']
+        resp = _session.get(url, timeout=20)
+        d = resp.json()
+        return d['candles']['data'], d['candles']['columns']
     except Exception:
         return None, None
 
