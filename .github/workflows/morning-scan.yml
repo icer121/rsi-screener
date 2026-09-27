@@ -29,5 +29,5 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_WORKERS: "15"
+          MAX_WORKERS: "8"
         run: python morning_screener.py
