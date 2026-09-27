@@ -1,4 +1,4 @@
-"""Единый движок скрининга MOEX. МСК + keep-alive соединения."""
+"""Единый движок MOEX. Обычный скан + обратное пересечение."""
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,10 +13,8 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))
 
 MSK = timezone(timedelta(hours=3))
 
-# Глобальная сессия — переиспользует TCP-соединение между запросами
 _session = requests.Session()
 _session.headers.update({'User-Agent': 'Mozilla/5.0'})
-# Пул соединений: по одному на каждый поток + запас
 _adapter = requests.adapters.HTTPAdapter(
     pool_connections=MAX_WORKERS + 2,
     pool_maxsize=MAX_WORKERS + 2,
@@ -88,6 +86,7 @@ def calc_rsi(closes, period=14):
     return rsi
 
 
+# ============ ОБЫЧНЫЙ СКАН (RSI < 30) ============
 def process_ticker(secid, cutoff):
     candles, cols = fetch_candles(secid, HISTORY_DAYS)
     if not candles or len(candles) < 100:
@@ -95,7 +94,6 @@ def process_ticker(secid, cutoff):
     c4 = aggregate_4h(candles, cols)
     if len(c4) < 20:
         return None
-
     closes = [c['close'] for c in c4]
     rsi = calc_rsi(closes, 14)
 
@@ -141,10 +139,8 @@ def process_ticker(secid, cutoff):
 def scan(progress_callback=None):
     tickers = get_tickers()
     cutoff = datetime.now(MSK) - timedelta(days=LOOKBACK_DAYS)
-    signals = []
-    charts = {}
-    checked = 0
-    processed = 0
+    signals, charts = [], {}
+    checked, processed = 0, 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_ticker, secid, cutoff): secid
@@ -167,21 +163,90 @@ def scan(progress_callback=None):
     return {'signals': signals, 'charts': charts, 'checked': checked}
 
 
+# ============ ОБРАТНЫЙ СКАН (RSI пересёк 30 снизу вверх) ============
+def process_ticker_reverse(secid, cutoff):
+    candles, cols = fetch_candles(secid, HISTORY_DAYS)
+    if not candles or len(candles) < 100:
+        return None
+    c4 = aggregate_4h(candles, cols)
+    if len(c4) < 20:
+        return None
+    closes = [c['close'] for c in c4]
+    rsi = calc_rsi(closes, 14)
+
+    crossovers = []
+    for j in range(1, len(c4)):
+        if rsi[j] is None or rsi[j-1] is None:
+            continue
+        try:
+            dt = datetime.strptime(c4[j]['begin'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=MSK)
+        except Exception:
+            continue
+        # Пересечение снизу вверх: было < 30, стало >= 30
+        if rsi[j-1] < RSI_THRESHOLD and rsi[j] >= RSI_THRESHOLD:
+            if dt >= cutoff:
+                crossovers.append({
+                    'datetime': c4[j]['begin'],
+                    'rsi_before': rsi[j-1],
+                    'rsi_after': rsi[j],
+                    'price': closes[j],
+                })
+
+    if not crossovers:
+        return {'checked': 1, 'crossovers': []}
+
+    items = [{
+        'ticker': secid,
+        'datetime': cv['datetime'],
+        'rsi_before': cv['rsi_before'],
+        'rsi_after': cv['rsi_after'],
+        'price': cv['price'],
+        'current_price': closes[-1],
+        'current_rsi': rsi[-1] if rsi[-1] else 0,
+    } for cv in crossovers]
+
+    return {'checked': 1, 'crossovers': items}
+
+
+def scan_reverse(progress_callback=None):
+    tickers = get_tickers()
+    cutoff = datetime.now(MSK) - timedelta(days=LOOKBACK_DAYS)
+    crossovers = []
+    checked, processed = 0, 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_ticker_reverse, secid, cutoff): secid
+                   for secid in tickers}
+        for future in as_completed(futures):
+            processed += 1
+            if progress_callback:
+                progress_callback(processed, len(tickers), futures[future])
+            try:
+                r = future.result()
+                if r:
+                    checked += r['checked']
+                    crossovers.extend(r['crossovers'])
+            except Exception:
+                pass
+
+    crossovers.sort(key=lambda x: x['datetime'], reverse=True)
+    return {'crossovers': crossovers, 'checked': checked}
+
+
 if __name__ == "__main__":
     start = time.time()
     print(f"Время: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M МСК')}")
     print(f"Потоков: {MAX_WORKERS}")
-    print("Загрузка...")
 
-    def show_progress(i, total, secid):
-        if i % 30 == 0 or i == total:
-            print(f"  {i}/{total} — {secid}")
-
-    result = scan(progress_callback=show_progress)
-    print(f"\nВремя: {time.time()-start:.1f} сек")
+    print("\n=== Прямой скан (RSI < 30) ===")
+    result = scan()
     print(f"Проверено: {result['checked']}")
     print(f"Сигналов: {len(result['signals'])}")
     print(f"Уникальных: {len(set(s['ticker'] for s in result['signals']))}")
-    print()
-    for s in result['signals'][:30]:
-        print(f"  {s['ticker']:8} {s['datetime']} RSI={s['rsi']:.1f} Цена={s['price']:.2f}")
+
+    print("\n=== Обратный скан (пересечение 30 снизу вверх) ===")
+    rev = scan_reverse()
+    print(f"Разворотов: {len(rev['crossovers'])}")
+    print(f"Уникальных: {len(set(c['ticker'] for c in rev['crossovers']))}")
+
+    print(f"\nОбщее время: {time.time()-start:.1f} сек")
