@@ -150,6 +150,7 @@ def format_rebound(result):
 
 
 def format_all_events(events):
+    """Календарь по всему рынку. Сортирует по date_obj, а не по строке."""
     now = datetime.now(MSK).strftime('%d.%m.%Y %H:%M')
     if not events:
         return (f"📅 *Календарь MOEX*\n_{now} МСК_\n\n"
@@ -159,18 +160,30 @@ def format_all_events(events):
            f"_{now} МСК_\n\n"
            f"Всего: *{len(events)}* (ближайшие 30 дней)\n\n")
 
+    # Группируем по строке даты, но сортируем по date_obj
     by_date = {}
     for ev in events:
-        by_date.setdefault(ev['date'], []).append(ev)
+        key = ev['date']
+        if key not in by_date:
+            by_date[key] = {'date_obj': ev.get('date_obj'), 'items': []}
+        by_date[key]['items'].append(ev)
 
-    for date_str in sorted(by_date.keys(),
-                            key=lambda d: datetime.strptime(d, '%d.%m.%Y')):
-        items = by_date[date_str]
+    # Сортируем ключи по date_obj (datetime), а не по строке
+    def sort_key(date_str):
+        info = by_date[date_str]
+        do = info.get('date_obj')
+        if do is None:
+            return datetime(2099, 1, 1)
+        return do
+
+    for date_str in sorted(by_date.keys(), key=sort_key):
+        items = by_date[date_str]['items']
         msg += f"*{date_str}*\n"
         for ev in items:
             text = re.sub(r'\d{2}\.\d{2}\.\d{4}', '', ev['text']).strip()
             text = re.sub(r'\s+', ' ', text)[:120]
-            msg += f"  `{ev['ticker']}` — {text}\n"
+            ticker = ev.get('ticker', '—')
+            msg += f"  `{ticker}` — {text}\n"
         msg += "\n"
 
     return msg
@@ -201,7 +214,7 @@ def main():
             send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, format_rebound(reb))
 
         print("4/4 Календарь по всему рынку...")
-        all_events = get_all_upcoming_events(days_ahead=30, max_events=50)
+        all_events = get_all_upcoming_events(days_ahead=30, max_events=100)
         print(f"  Событий: {len(all_events)}")
         send_long(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
                   format_all_events(all_events))
