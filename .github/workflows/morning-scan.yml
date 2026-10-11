@@ -2,8 +2,11 @@ name: Morning RSI Scan
 
 on:
   schedule:
-    - cron: '0 7 * * *'   # 10:00 МСК
+    - cron: '0 7 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   scan:
@@ -30,3 +33,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MAX_WORKERS: "8"
         run: python morning_screener.py
+
+      - name: Commit investmint cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add investmint_cache.json
+          if git diff --staged --quiet; then
+            echo "Изменений нет"
+          else
+            git commit -m "Update investmint cache [skip ci]"
+            git push
+          fi
