@@ -1,4 +1,4 @@
-"""Парсер событий: smart-lab + investmint (MCP). С рабочим кэшем."""
+"""Парсер событий: smart-lab + investmint (MCP)."""
 import json
 import re
 import requests
@@ -6,7 +6,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# ==== smart-lab ====
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Accept-Language': 'ru-RU,ru;q=0.9',
@@ -16,7 +15,6 @@ PAGES = [
     ("https://smart-lab.ru/dividends/", "Дивиденды"),
 ]
 
-# ==== investmint MCP ====
 MCP_URL = "https://mcp.investmint.ru/mcp"
 MCP_HEADERS = {
     "Content-Type": "application/json",
@@ -26,6 +24,12 @@ CACHE_FILE = Path(__file__).parent / "investmint_cache.json"
 CACHE_TTL_HOURS = 12
 MAX_MCP_TICKERS = 20
 
+WARMUP_TICKERS = [
+    'SBER', 'GAZP', 'LKOH', 'GMKN', 'ROSN', 'NVTK', 'TATN',
+    'SNGS', 'PLZL', 'CHMF', 'NLMK', 'MAGN', 'ALRS', 'MTSS',
+    'MGNT', 'MOEX', 'VTBR', 'AFKS', 'YDEX', 'OZON',
+]
+
 MONTHS_RU = {
     'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4,
     'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
@@ -33,9 +37,6 @@ MONTHS_RU = {
 }
 
 
-# ============================================================
-#                          SMART-LAB
-# ============================================================
 def _clean_text(text, ticker):
     text = re.sub(r'(\d{2}\.\d{2}\.\d{4})\s+\1', r'\1', text)
     text = re.sub(r'\d{2}\.\d{2}\.\d{4}', '', text)
@@ -138,11 +139,8 @@ def _get_smartlab_all_upcoming(days_ahead=30, max_events=50):
                     continue
                 seen.add(key)
                 all_events.append({
-                    'date': ds,
-                    'date_obj': do,
-                    'ticker': t,
-                    'text': clean,
-                    'source': 'smart-lab',
+                    'date': ds, 'date_obj': do, 'ticker': t,
+                    'text': clean, 'source': 'smart-lab',
                 })
     except Exception as e:
         print(f"smart-lab ошибка: {e}")
@@ -150,9 +148,6 @@ def _get_smartlab_all_upcoming(days_ahead=30, max_events=50):
     return all_events[:max_events]
 
 
-# ============================================================
-#                          INVESTMINT
-# ============================================================
 def _decode_utf8(s):
     try:
         return s.encode('latin-1').decode('utf-8')
@@ -180,10 +175,8 @@ def _parse_date_inv(s):
 
 def _mcp_call(tool_name, arguments):
     payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {"name": tool_name, "arguments": arguments},
-        "id": 1,
+        "jsonrpc": "2.0", "method": "tools/call",
+        "params": {"name": tool_name, "arguments": arguments}, "id": 1,
     }
     try:
         r = requests.post(MCP_URL, json=payload, headers=MCP_HEADERS, timeout=20)
@@ -201,11 +194,9 @@ def _mcp_call(tool_name, arguments):
     return None
 
 
-# --- сериализация / десериализация ---
-def _serialize(events_dict):
-    """datetime -> ISO строка для JSON."""
+def _serialize(d):
     out = {}
-    for t, evs in events_dict.items():
+    for t, evs in d.items():
         out[t] = []
         for e in evs:
             e2 = dict(e)
@@ -215,10 +206,9 @@ def _serialize(events_dict):
     return out
 
 
-def _deserialize(data):
-    """ISO строка -> datetime."""
+def _deserialize(d):
     out = {}
-    for t, evs in data.items():
+    for t, evs in d.items():
         out[t] = []
         for e in evs:
             e2 = dict(e)
@@ -244,8 +234,7 @@ def _save_cache(data):
     try:
         CACHE_FILE.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
-            encoding='utf-8',
-        )
+            encoding='utf-8')
     except Exception as e:
         print(f"Ошибка кэша: {e}")
 
@@ -261,33 +250,21 @@ def _cache_fresh(cache):
 
 
 def _get_investmint_calendar(tickers):
-    """
-    События с investmint по списку тикеров.
-    ВАЖНО: investmint отдаёт события сразу по многим тикерам из одной выборки,
-    поэтому за один запрос мы получаем данные и по другим бумагам.
-    Кэш хранит всё, что накопилось.
-    """
     tickers = [t.upper() for t in tickers[:MAX_MCP_TICKERS]]
     if not tickers:
         return {}
 
-    # Загружаем кэш
     cache = _load_cache()
     cached_raw = {}
     if cache and _cache_fresh(cache):
         cached_raw = _deserialize(cache.get('data', {}))
-        # Если все нужные тикеры есть в кэше — возвращаем сразу
-        if all(t in cached_raw for t in tickers):
-            print(f"  investmint: из кэша ({len(cached_raw)} тикеров)")
-            return {t: cached_raw[t] for t in tickers if t in cached_raw}
 
-    # Догружаем недостающие тикеры
     to_query = [t for t in tickers if t not in cached_raw]
-    print(f"  investmint: запрос для {len(to_query)} тикеров...")
+    if to_query:
+        print(f"  investmint: запрос для {len(to_query)} тикеров...")
 
     new_data = {}
     seen = set()
-
     for t in to_query:
         raw = _mcp_call("investmint_calendar", {"ticker": t})
         if not raw:
@@ -300,9 +277,7 @@ def _get_investmint_calendar(tickers):
             date_str = ev.get('date', '')
             title = ev.get('title', '')
             date_obj = _parse_date_inv(date_str)
-            ev_tickers = ev.get('tickers', []) or [t]
-            # investmint возвращает события сразу для многих тикеров
-            for et in ev_tickers:
+            for et in (ev.get('tickers') or [t]):
                 et = et.upper()
                 key = (et, date_str, title)
                 if key in seen:
@@ -316,38 +291,36 @@ def _get_investmint_calendar(tickers):
                     'source': 'investmint',
                 })
 
-    # Объединяем кэш + новое
     merged = dict(cached_raw)
     for t, evs in new_data.items():
         merged.setdefault(t, []).extend(evs)
 
-    # Дедупликация и сортировка
     for t in merged:
         uniq = {}
         for e in merged[t]:
-            k = (e['date'], e['text'][:60])
-            uniq[k] = e
-        merged[t] = sorted(uniq.values(), key=lambda x: x.get('date_obj') or datetime(2099, 1, 1))
+            uniq[(e['date'], e['text'][:60])] = e
+        merged[t] = sorted(uniq.values(),
+                           key=lambda x: x.get('date_obj') or datetime(2099, 1, 1))
 
-    # Сохраняем
-    _save_cache({
-        'timestamp': datetime.now().isoformat(),
-        'data': _serialize(merged),
-    })
+    _save_cache({'timestamp': datetime.now().isoformat(),
+                 'data': _serialize(merged)})
 
     return {t: merged[t] for t in tickers if t in merged}
 
 
-# ============================================================
-#                    ПУБЛИЧНЫЕ ФУНКЦИИ
-# ============================================================
+def warmup_investmint_cache():
+    """Прогревает кэш investmint по топ-20 ликвидным тикерам."""
+    try:
+        _get_investmint_calendar(WARMUP_TICKERS)
+    except Exception as e:
+        print(f"Ошибка прогрева кэша: {e}")
+
+
 def get_events(tickers, max_per_ticker=6):
-    """События по тикерам из ДВУХ источников: smart-lab + investmint."""
     if not tickers:
         return {}
     sl = _get_smartlab_events(tickers)
     inv = _get_investmint_calendar(tickers)
-
     result = {}
     for t in set(list(sl.keys()) + list(inv.keys())):
         merged = []
@@ -364,11 +337,11 @@ def get_events(tickers, max_per_ticker=6):
 
 
 def get_all_upcoming_events(days_ahead=30, max_events=100):
-    """Все предстоящие события по рынку из обоих источников."""
-    # 1) smart-lab общий календарь
+    # Прогрев кэша по топ-20
+    warmup_investmint_cache()
+
     sl_events = _get_smartlab_all_upcoming(days_ahead, max_events * 2)
 
-    # 2) investmint — используем кэш, который мог накопиться
     inv_events = []
     cache = _load_cache()
     if cache and _cache_fresh(cache):
@@ -378,19 +351,13 @@ def get_all_upcoming_events(days_ahead=30, max_events=100):
         for t, evs in cached.items():
             for e in evs:
                 do = e.get('date_obj')
-                if not do:
-                    continue
-                if do < today or do > cutoff:
+                if not do or do < today or do > cutoff:
                     continue
                 inv_events.append({
-                    'date': e['date'],
-                    'date_obj': do,
-                    'ticker': t,
-                    'text': e['text'],
-                    'source': 'investmint',
+                    'date': e['date'], 'date_obj': do, 'ticker': t,
+                    'text': e['text'], 'source': 'investmint',
                 })
 
-    # Объединяем и дедуплицируем
     all_ev = []
     seen = set()
     for ev in sl_events + inv_events:
