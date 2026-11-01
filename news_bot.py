@@ -26,10 +26,28 @@ GNEWS_KEY = os.environ.get("GNEWS_API_KEY", "")
 NEWSAPI_KEY = os.environ.get("NEWSAPI_API_KEY", "")
 OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 INCEPTION_KEY = os.environ.get("INCEPTION_API_KEY", "")
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+GH_REPO = os.environ.get("GH_REPO", "icer121/rsi-screener")
 
 STATE_FILE = "state.json"
 TICKERS_FILE = "tickers.txt"
 MARKET = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{t}/candles.json?interval=24&iss.meta=off&iss.only=candles&from={dfrom}&till={till}"
+
+
+# ---------- Тикеры: файл tickers.txt как источник ----------
+def load_tickers():
+    try:
+        with open(TICKERS_FILE, "r", encoding="utf-8") as f:
+            return [l.strip().upper() for l in f if l.strip()]
+    except Exception:
+        return []
+
+
+def save_tickers(tickers):
+    with open(TICKERS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(tickers))
+    # Внимание: для GitHub Actions тикеры читаются из tickers.txt в репо.
+    # Чтобы синхронизировать: после /track закоммить tickers.txt в GitHub.
 
 
 # ---------- Состояние ----------
@@ -53,17 +71,6 @@ def load_portfolio():
 def save_portfolio(portfolio):
     state = load_state()
     state["portfolio"] = portfolio
-    save_state(state)
-
-
-def load_tickers():
-    state = load_state()
-    return state.get("tickers", [])
-
-
-def save_tickers(tickers):
-    state = load_state()
-    state["tickers"] = tickers
     save_state(state)
 
 
@@ -350,8 +357,42 @@ def handle_command(text):
             tg_send("По какой акции? Напиши, например: «что с Сбером?»")
         return
 
-    # 3) «новости / сводка / события»
-    if any(w in text for w in ("новост", "сводк", "событ")):
+    # 3) «новости / сводка / события / отчёты / дивиденды» (+тикер если указан)
+    if any(w in text for w in ("новост", "сводк", "событ", "отчёт", "отчет", "дивиденд")):
+        # ищем тикер в тексте
+        target = None
+        all_tickers = ["SBER", "GAZP", "LKOH", "ROSN", "GMKN", "NVTK", "VTBR", "TATN",
+                       "MTSS", "AFLT", "SNGSP", "ALRS", "CHMF", "NLMK", "MAGN",
+                       "PLZL", "RUAL", "PHOR"]
+        for t in all_tickers:
+            if t.lower() in text.lower():
+                target = t
+                break
+        if not target:
+            names_map = {
+                "сбер": "SBER", "сбербанк": "SBER", "газпром": "GAZP", "лукойл": "LKOH",
+                "роснефть": "ROSN", "норникель": "GMKN", "новатэк": "NVTK", "втб": "VTBR",
+                "татнефть": "TATN", "мтс": "MTSS", "аэрофлот": "AFLT", "сургут": "SNGSP",
+                "алроса": "ALRS", "северсталь": "CHMF", "нлмк": "NLMK", "ммк": "MAGN",
+                "полюс": "PLZL", "русал": "RUAL", "фосагро": "PHOR",
+            }
+            for ru, tk in names_map.items():
+                if ru in text:
+                    target = tk
+                    break
+        if target:
+            # запрос по конкретному тикеру
+            if "событ" in text or "отчёт" in text or "отчет" in text or "дивиденд" in text:
+                res = ask_edge(f"события {target}")
+                tg_send(res if res else f"Не удалось получить события по {target}")
+            else:
+                n = get_news(target)
+                if n:
+                    tg_send(f"📰 {target}:\n" + "\n".join("• " + x[:120] for x in n[:3]))
+                else:
+                    tg_send(f"Свежих важных новостей по {target} нет")
+            return
+        # без тикера — по всем позициям
         if not tickers:
             tg_send("Список пуст. Добавь: «следи за Сбером»")
             return
@@ -380,27 +421,37 @@ def handle_command(text):
 
 # ---------- Утр. сводка ----------
 def morning_summary():
-    tickers = load_tickers()
-    if not tickers:
-        tg_send("☀️ Утренняя сводка " + time.strftime("%d.%m.%Y") + "\nСписок позиций пуст. Добавь: /track SBER")
-        return
     lines = ["☀️ Утренняя сводка " + time.strftime("%d.%m.%Y"), ""]
-    for t in tickers:
-        p = get_price(t)
-        n = get_news(t)
-        lines.append(f"📊 {t}:")
-        if p is not None:
-            lines.append(f"   Цена: {p:.2f} ₽")
-        if n:
-            lines.append("   📰 Новости:")
-            for x in n[:2]:
-                lines.append("     • " + x[:110])
-        # События/дивиденды через Edge Function
-        res = ask_edge(f"события {t}")
-        if res and "События" in res:
-            lines.append("   📅 События:")
-            lines.append("     " + res.replace("\n", "\n     "))
+
+    # 1) Главные новости рынка (общие, не по тикерам)
+    res = ask_edge("главные новости рынка России")
+    if res and len(res) > 20 and "Новостей" not in res:
+        lines.append("📰 Главные новости рынка:")
+        lines.append(res[:800])
         lines.append("")
+
+    # 2) Лидеры / аутсайдеры дня
+    leaders = ask_edge("лидеры дня")
+    if leaders and "Лидеры" in leaders:
+        lines.append("🚀 Лидеры дня:")
+        lines.append(leaders[:500])
+        lines.append("")
+    falls = ask_edge("аутсайдеры дня")
+    if falls and "Аутсайдеры" in falls:
+        lines.append("📉 Аутсайдеры дня:")
+        lines.append(falls[:500])
+        lines.append("")
+
+    # 3) События по отслеживаемым тикерам (если есть)
+    tickers = load_tickers()
+    if tickers:
+        lines.append(f"📅 События по позициям ({len(tickers)}):")
+        for t in tickers:
+            ev = ask_edge(f"события {t}")
+            if ev and "События" in ev and "не нашлось" not in ev:
+                lines.append(" • " + t + ": " + ev.replace("📅 События ", "").replace("\n", " | ")[:300])
+        lines.append("")
+
     tg_send("\n".join(lines))
 
 
